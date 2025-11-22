@@ -1,0 +1,12 @@
+[project]
+name = "e2b-hackason-dev"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "e2b-code-interpreter>=2.3.0",
+    "groq>=0.36.0",
+    "python-dotenv>=1.2.1",
+    "streamlit>=1.51.0",
+]
