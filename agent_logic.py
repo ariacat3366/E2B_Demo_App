@@ -1,17 +1,15 @@
 import os
 import base64
+import json
 import time
-import importlib
 from e2b_code_interpreter import Sandbox
 from dotenv import load_dotenv
 
-Groq = None
-_groq_spec = importlib.util.find_spec("groq")
-if _groq_spec:
-    GroqModule = importlib.import_module("groq")
-    Groq = getattr(GroqModule, "Groq", None)
+try:
+    from groq import Groq
+except ImportError:  # pragma: no cover
+    Groq = None
 
-# .envの読み込み
 load_dotenv()
 
 
@@ -19,16 +17,18 @@ class DiffVisionAgent:
     def __init__(self):
         self.e2b_api_key = os.getenv("E2B_API_KEY")
         self.groq_api_key = os.getenv("GROQ_API_KEY")
-        self.slack_token = os.getenv("SLACK_BOT_TOKEN")
         self.github_token = os.getenv("GITHUB_ACCESS_TOKEN")
 
         if not self.e2b_api_key:
             raise ValueError("E2B_API_KEY not found in .env")
 
         self.groq_client = Groq(api_key=self.groq_api_key) if self.groq_api_key and Groq else None
+        self.selector_model = os.getenv("GROQ_SELECTOR_MODEL", "llama3-8b-8192")
+        self.vision_model = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+        self.diff_prompt_chars = int(os.getenv("GIT_DIFF_PROMPT_CHARS", "6000"))
 
     @staticmethod
-    def _decode_output(stream):
+    def _to_text(stream):
         if isinstance(stream, (bytes, bytearray)):
             return stream.decode("utf-8", errors="ignore")
         return stream or ""
@@ -40,26 +40,15 @@ class DiffVisionAgent:
         return data
 
     def analyze_pr(
-        self,
-        repo_url: str,
-        main_branch: str,
-        feature_branch: str,
-        status_callback=None,
-        use_slack: bool = False,
-        slack_channel: str = "",
-        skip_ai: bool = False,
-        use_github: bool = False,
+        self, repo_url: str, pr_number: int = None, status_callback=None, skip_ai=False, notify_github=False
     ):
         """
-        Main Flow:
-        1. E2B起動 (Tools環境)
-        2. Git/Browser Toolで画像取得
-        3. Groq (Local) で解析
-        4. Slack/GitHub Tool (E2B内) で通知
+        Main Logic: Diff -> Selectors -> Screenshots (Full & Partial) -> GitHub Comment
         """
         results = {
             "main_screenshot": None,
             "feature_screenshot": None,
+            "partial_screenshot": None,
             "git_diff": "",
             "ai_report": "",
             "logs": [],
@@ -71,48 +60,96 @@ class DiffVisionAgent:
                 status_callback(message)
             print(f"[Agent] {message}")
 
-        log("🚀 Starting E2B Sandbox (Tool Environment)...")
-
-        env_vars = {}
-        if self.slack_token:
-            env_vars["SLACK_BOT_TOKEN"] = self.slack_token
+        envs = {}
         if self.github_token:
-            env_vars["GITHUB_ACCESS_TOKEN"] = self.github_token
+            envs["GITHUB_ACCESS_TOKEN"] = self.github_token
 
-        sandbox_kwargs = {}
-        if self.e2b_api_key:
-            sandbox_kwargs["api_key"] = self.e2b_api_key
-        if env_vars:
-            sandbox_kwargs["env_vars"] = env_vars
+        log("🚀 Starting E2B Sandbox...")
+
+        sandbox_kwargs = {"api_key": self.e2b_api_key}
+        if envs:
+            sandbox_kwargs["envs"] = envs
 
         with Sandbox.create(**sandbox_kwargs) as sandbox:
-            log("📦 Sandbox Ready. Installing Tools...")
-            setup_cmds = [
-                "pip install playwright slack_sdk PyGithub",
-                "playwright install chromium --with-deps",
-                # Vite系テンプレートに同梱されているnpmで問題ないためグローバル更新は行わない
-                "npm --version",
-            ]
+            log("📦 Sandbox ready. Installing tools...")
 
-            for cmd in setup_cmds:
-                log(f"⚙️ Installing Tool: {cmd}...")
-                sandbox.commands.run(cmd)
+            sandbox.commands.run("pip install playwright PyGithub")
+            sandbox.commands.run("playwright install chromium --with-deps")
+            sandbox.commands.run("npm --version")
 
-            log(f"🔍 Cloning Repository: {repo_url}")
+            repo_name = repo_url.replace("https://github.com/", "").replace(".git", "")
+            log(f"🔍 Fetching PR info for {repo_name}...")
+
+            pr_fetch_script = f"""
+import os
+import json
+from github import Github
+
+token = os.getenv("GITHUB_ACCESS_TOKEN")
+g = Github(token)
+repo = g.get_repo("{repo_name}")
+pr_number = {pr_number if pr_number else 'None'}
+
+if pr_number:
+    pr = repo.get_pull(pr_number)
+else:
+    pulls = repo.get_pulls(state='open', sort='created', direction='desc')
+    if pulls.totalCount > 0:
+        pr = pulls[0]
+    else:
+        print(json.dumps({{"error": "No open PR found"}}))
+        exit()
+
+print(json.dumps({{
+    "number": pr.number,
+    "title": pr.title,
+    "base_branch": pr.base.ref,
+    "head_branch": pr.head.ref,
+    "html_url": pr.html_url
+}}))
+"""
+            sandbox.files.write("/home/user/get_pr_info.py", pr_fetch_script)
+            pr_proc = sandbox.commands.run("python /home/user/get_pr_info.py")
+
+            try:
+                pr_info = json.loads(self._to_text(pr_proc.stdout))
+                if "error" in pr_info:
+                    log(f"❌ {pr_info['error']}")
+                    return results
+            except json.JSONDecodeError:
+                log("❌ Error parsing PR info")
+                return results
+
+            base_branch = pr_info["base_branch"]
+            head_branch = pr_info["head_branch"]
+            current_pr_number = pr_info["number"]
+            log(f"✅ Target PR #{current_pr_number}: {base_branch} <- {head_branch}")
+
             sandbox.commands.run(f"git clone {repo_url} /home/user/repo")
+            sandbox.commands.run(
+                f"cd /home/user/repo && git fetch origin {base_branch} && git fetch origin {head_branch}"
+            )
 
-            def capture_branch_state(branch_name, label):
+            log("📝 Extracting Git diff...")
+            diff_proc = sandbox.commands.run(
+                f"cd /home/user/repo && git diff origin/{base_branch}..origin/{head_branch}"
+            )
+            results["git_diff"] = self._to_text(diff_proc.stdout)
+
+            target_selector = "body"
+            if not skip_ai and results["git_diff"]:
+                log("🧠 Analyzing diff to identify UI selectors...")
+                target_selector = self.detect_changed_selector(results["git_diff"])
+                log(f"🎯 Targeted selector for screenshot: '{target_selector}'")
+
+            def capture_branch_state(branch_name, label, selector="body"):
                 log(f"🔀 Processing {label}: {branch_name}")
-                sandbox.commands.run(f"cd /home/user/repo && git fetch origin && git checkout {branch_name}")
-                log(f"📦 Installing dependencies for {branch_name}...")
+                sandbox.commands.run(f"cd /home/user/repo && git checkout {branch_name}")
                 sandbox.commands.run("cd /home/user/repo && npm install")
-
-                log(f"🚀 Starting Dev Server for {branch_name}...")
                 sandbox.commands.run("cd /home/user/repo && npm run dev -- --host &", background=True)
                 time.sleep(5)
 
-                log(f"📸 Taking Screenshot: {label}")
-                screenshot_script = """
+                screenshot_script = f"""
 import asyncio
 from playwright.async_api import async_playwright
 
@@ -123,10 +160,22 @@ async def run():
         try:
             await page.goto("http://localhost:5173", timeout=10000)
             await page.wait_for_timeout(2000)
-            await page.screenshot(path="/home/user/screenshot.png", full_page=True)
-            print("SUCCESS")
+
+            await page.screenshot(path="/home/user/full.png", full_page=True)
+
+            try:
+                locator = page.locator("{selector}")
+                if await locator.count() > 0:
+                    await locator.first.screenshot(path="/home/user/partial.png")
+                    print("PARTIAL_SUCCESS")
+                else:
+                    print("SELECTOR_NOT_FOUND")
+            except Exception:
+                print("PARTIAL_FAIL")
+
+            print("FULL_SUCCESS")
         except Exception as e:
-            print(f"ERROR: {e}")
+            print(f"ERROR: {{e}}")
         finally:
             await browser.close()
 
@@ -134,179 +183,194 @@ asyncio.run(run())
 """
                 sandbox.files.write("/home/user/take_shot.py", screenshot_script)
                 proc = sandbox.commands.run("python /home/user/take_shot.py")
-                stdout_text = self._decode_output(proc.stdout)
+                stdout_text = self._to_text(proc.stdout)
 
-                if "SUCCESS" in stdout_text:
-                    img_bytes = sandbox.files.read("/home/user/screenshot.png", format="bytes")
-                    img_bytes = self._ensure_bytes(img_bytes)
-                    sandbox.commands.run("pkill -f node")
-                    return img_bytes
+                full_bytes = None
+                partial_bytes = None
 
-                stderr_text = self._decode_output(proc.stderr)
-                log(f"❌ Screenshot failed: {stdout_text} {stderr_text}")
+                if "FULL_SUCCESS" in stdout_text:
+                    full_bytes = sandbox.files.read("/home/user/full.png", format="bytes")
+                    full_bytes = self._ensure_bytes(full_bytes)
+
+                if "PARTIAL_SUCCESS" in stdout_text:
+                    partial_bytes = sandbox.files.read("/home/user/partial.png", format="bytes")
+                    partial_bytes = self._ensure_bytes(partial_bytes)
+
                 sandbox.commands.run("pkill -f node")
-                return None
+                return full_bytes, partial_bytes
 
-            results["main_screenshot"] = capture_branch_state(main_branch, "Main Branch")
-            results["feature_screenshot"] = capture_branch_state(feature_branch, "Feature Branch")
-
-            log("📝 Extracting Git Diff...")
-            diff_proc = sandbox.commands.run(
-                f"cd /home/user/repo && git diff origin/{main_branch}..origin/{feature_branch}"
-            )
-            results["git_diff"] = self._decode_output(diff_proc.stdout)
+            main_full, _ = capture_branch_state(base_branch, "Main Branch")
+            feature_full, feature_partial = capture_branch_state(head_branch, "Feature Branch", target_selector)
+            results["main_screenshot"] = main_full
+            results["feature_screenshot"] = feature_full
+            results["partial_screenshot"] = feature_partial
 
             if skip_ai:
-                log("🛑 Test Mode: AI Analysis & Notification skipped.")
+                log("ℹ️ AI analysis skipped by mode setting.")
                 return results
 
             if self.groq_client and results["main_screenshot"] and results["feature_screenshot"]:
-                log("🧠 Analyzing Differences with Groq Vision AI (Local)...")
+                log("🧠 Generating final report with Groq Vision...")
                 try:
                     report = self.generate_analysis_report(
                         results["main_screenshot"], results["feature_screenshot"], results["git_diff"]
                     )
                     results["ai_report"] = report
-                    log("✨ AI Analysis Generated.")
-                except Exception as exc:
-                    log(f"⚠️ AI Analysis failed: {exc}")
-                    results["ai_report"] = f"AI Analysis Failed: {exc}"
+                except Exception as exc:  # pragma: no cover
+                    log(f"⚠️ AI analysis failed: {exc}")
+                    results["ai_report"] = "Analysis failed."
 
-            if use_slack and self.slack_token and results["ai_report"]:
-                log(f"📢 Executing Slack Tool inside E2B ({slack_channel})...")
-                if results["main_screenshot"]:
-                    sandbox.files.write("/home/user/before.png", results["main_screenshot"])
-                if results["feature_screenshot"]:
-                    sandbox.files.write("/home/user/after.png", results["feature_screenshot"])
-                sandbox.files.write("/home/user/report.txt", results["ai_report"])
-
-                slack_script = f"""
-import os
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
-
-token = os.getenv("SLACK_BOT_TOKEN")
-client = WebClient(token=token)
-channel = "{slack_channel}"
-
-try:
-    if os.path.exists("/home/user/before.png"):
-        with open("/home/user/before.png", "rb") as f:
-            client.files_upload_v2(channel=channel, file=f, filename="before.png", title="🟥 Before")
-
-    if os.path.exists("/home/user/after.png"):
-        with open("/home/user/after.png", "rb") as f:
-            client.files_upload_v2(channel=channel, file=f, filename="after.png", title="🟩 After")
-
-    with open("/home/user/report.txt", "r") as f:
-        report = f.read()
-
-    client.chat_postMessage(
-        channel=channel,
-        text=f"*🤖 Diff-Vision Agent Report (from E2B)*\\n\\n{{report}}",
-        mrkdwn=True
-    )
-    print("SLACK_SUCCESS")
-except Exception as e:
-    print(f"SLACK_ERROR: {{e}}")
-"""
-                sandbox.files.write("/home/user/notify_slack.py", slack_script)
-                slack_proc = sandbox.commands.run("python /home/user/notify_slack.py")
-                slack_stdout = self._decode_output(slack_proc.stdout)
-                slack_stderr = self._decode_output(slack_proc.stderr)
-                if "SLACK_SUCCESS" in slack_stdout:
-                    log("✅ Slack Notification Sent via E2B.")
+            if results["ai_report"] and notify_github:
+                if not self.github_token:
+                    log("⚠️ GitHub token missing. Skipping notification.")
                 else:
-                    log(f"⚠️ Slack Tool Failed: {slack_stdout} {slack_stderr}")
-
-            if use_github and self.github_token and results["ai_report"]:
-                try:
-                    repo_name = repo_url.replace("https://github.com/", "").replace(".git", "")
-                    log(f"🐱 Executing GitHub Tool inside E2B ({repo_name})...")
+                    log("📤 Uploading assets and commenting on GitHub PR...")
                     sandbox.files.write("/home/user/report.txt", results["ai_report"])
+                    if results["main_screenshot"]:
+                        sandbox.files.write("/home/user/before.png", results["main_screenshot"])
+                    if results["feature_screenshot"]:
+                        sandbox.files.write("/home/user/after.png", results["feature_screenshot"])
+                    if results["partial_screenshot"]:
+                        sandbox.files.write("/home/user/diff_focus.png", results["partial_screenshot"])
 
                     github_script = f"""
 import os
+import time
 from github import Github
 
 token = os.getenv("GITHUB_ACCESS_TOKEN")
 g = Github(token)
 repo = g.get_repo("{repo_name}")
+pr = repo.get_pull({current_pr_number})
 
-with open("/home/user/report.txt", "r") as f:
-    report = f.read()
+branch_name = "diff-artifacts"
+try:
+    repo.get_branch(branch_name)
+except Exception:
+    sb = repo.get_branch(repo.default_branch)
+    repo.create_git_ref(ref=f"refs/heads/{{branch_name}}", sha=sb.commit.sha)
 
-pulls = repo.get_pulls(state='open', sort='created', direction='desc')
-if pulls.totalCount > 0:
-    pr = pulls[0]
-    pr.create_issue_comment("## 🤖 Diff-Vision Analysis Report\\n\\n" + report + "\\n\\n*Generated by E2B Agent*")
-    print("GITHUB_SUCCESS")
-else:
-    print("GITHUB_NO_PR")
+timestamp = int(time.time())
+base_path = f"reports/pr_{current_pr_number}/{{timestamp}}"
+
+def upload_file(path, content, msg):
+    try:
+        repo.create_file(
+            path=f"{{base_path}}/{{path}}",
+            message=msg,
+            content=content,
+            branch=branch_name
+        )
+        return f"https://raw.githubusercontent.com/{repo_name}/{{branch_name}}/{{base_path}}/{{path}}"
+    except Exception as e:
+        print(f"UPLOAD_FAIL: {{e}}")
+        return None
+
+print("Uploading Before Image...")
+url_before = upload_file("before.png", open("/home/user/before.png", "rb").read(), "Add before img")
+
+print("Uploading After Image...")
+url_after = upload_file("after.png", open("/home/user/after.png", "rb").read(), "Add after img")
+
+url_partial = None
+if os.path.exists("/home/user/diff_focus.png"):
+    print("Uploading Partial Image...")
+    url_partial = upload_file("focus.png", open("/home/user/diff_focus.png", "rb").read(), "Add focus img")
+
+report_text = open("/home/user/report.txt").read()
+
+comment_body = f\"\"\"
+## 🤖 Diff-Vision Analysis Report
+
+{{report_text}}
+
+### 📸 Visual Differences
+
+| Before (Main) | After (Feature) |
+|:---:|:---:|
+| ![]({{url_before}}) | ![]({{url_after}}) |
+\"\"\"
+
+if url_partial:
+    comment_body += f"\\n### 🔍 Focus Area\\n![]({{url_partial}})"
+
+pr.create_issue_comment(comment_body)
+print("GITHUB_SUCCESS")
 """
-                    sandbox.files.write("/home/user/comment_github.py", github_script)
-                    gh_proc = sandbox.commands.run("python /home/user/comment_github.py")
-                    gh_stdout = self._decode_output(gh_proc.stdout)
-                    gh_stderr = self._decode_output(gh_proc.stderr)
-
-                    if "GITHUB_SUCCESS" in gh_stdout:
-                        log("✅ GitHub Comment Posted via E2B.")
+                    sandbox.files.write("/home/user/post_gh.py", github_script)
+                    gh_proc = sandbox.commands.run("python /home/user/post_gh.py")
+                    if "GITHUB_SUCCESS" in self._to_text(gh_proc.stdout):
+                        log("✅ GitHub comment posted with artifacts.")
                     else:
-                        log(f"ℹ️ GitHub Tool Log: {gh_stdout} {gh_stderr}")
-                except Exception as exc:
-                    log(f"⚠️ GitHub Tool Error: {exc}")
+                        log(f"⚠️ GitHub post failed: {self._to_text(gh_proc.stdout)} {self._to_text(gh_proc.stderr)}")
+            elif results["ai_report"] and not notify_github:
+                log("ℹ️ Skipping GitHub notification per mode setting.")
 
-            log("✅ All Tasks Completed.")
+            log("✅ Process finished.")
 
         return results
 
-    def generate_analysis_report(self, img_before: bytes, img_after: bytes, diff_text: str):
+    def detect_changed_selector(self, diff_text):
         """
-        Groq Vision API (Llama 3.2 Vision) を使用してレポート生成
+        Infer one CSS selector that most likely changed based on the diff.
         """
+        if not self.groq_client or not diff_text:
+            return "body"
+
+        prompt = f"""
+Analyze the following Git diff and return exactly one CSS selector for the UI element most likely impacted.
+
+Diff:
+{diff_text[:1500]}
+
+Respond with JSON only, e.g. {{ "selector": ".class-name" }}
+"""
+        try:
+            completion = self.groq_client.chat.completions.create(
+                model=self.selector_model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            res = json.loads(completion.choices[0].message.content)
+            return res.get("selector", "body")
+        except Exception:
+            return "body"
+
+    def generate_analysis_report(self, img_before, img_after, diff_text):
+        if not self.groq_client:
+            raise ValueError("Groq client is not configured.")
+
         b64_before = base64.b64encode(img_before).decode("utf-8")
         b64_after = base64.b64encode(img_after).decode("utf-8")
-        truncated_diff = f"{diff_text[:2000]} ... (truncated)" if diff_text else "Diff not available."
-        prompt = f"""
-あなたは熟練したUI/UXエンジニア兼コードレビュアーです。
-以下の2つの画像（変更前、変更後）と、GitのDiff情報を分析し、変更内容の解説レポートを作成してください。
+        diff_excerpt = (diff_text or "")[: self.diff_prompt_chars]
+        if diff_text and len(diff_text) > self.diff_prompt_chars:
+            diff_excerpt = f"{diff_excerpt}\n... (diff truncated)"
 
-## Input Data
-- Image 1: Before Change (Main Branch)
-- Image 2: After Change (Feature Branch)
-- Git Diff:
-```
-{truncated_diff}
-```
+        prompt = f"""
+Use the Git diff and the before/after screenshots to explain the change.
+
+Git Diff:
+{diff_excerpt}
 
 ## Output Format (Markdown)
-以下のセクションで簡潔に日本語で記述してください：
-1. **変更概要**: 何が変わったか（見た目、機能）
-2. **デザイン変更点**: 色、レイアウト、追加された要素など視覚的な違い
-3. **コード解析**: Diffから読み取れる技術的な変更点（コンポーネント、ロジック）
-4. **レビュワーコメント**: 改善点や注意点があれば
-
-出力はMarkdownのみにしてください。
+- **Summary**: single sentence
+- **UI Changes**: concrete visual differences
+- **Code Changes**: technical reasoning from the diff
+- **Notes for Reviewers**: any caveats or follow-ups
 """
+
         completion = self.groq_client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview",
+            model=self.vision_model,
             messages=[
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64_before}"},
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64_after}"},
-                        },
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_before}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64_after}"}},
                     ],
                 }
             ],
-            temperature=0.7,
             max_tokens=1024,
         )
         return completion.choices[0].message.content
