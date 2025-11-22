@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "e2b-code-interpreter>=2.3.0",
     "groq>=0.36.0",
+    "mcp-gateway>=1.1.0",
     "python-dotenv>=1.2.1",
     "streamlit>=1.51.0",
 ]

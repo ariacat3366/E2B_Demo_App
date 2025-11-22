@@ -66,6 +66,15 @@ with st.sidebar:
     if current_mode["notify_github"]:
         st.info("✅ GitHub notification is enabled.")
 
+    max_pages = st.number_input(
+        "Max auto-detected pages",
+        min_value=1,
+        max_value=5,
+        value=1,
+        step=1,
+        help="Controls how many pages the agent will attempt to auto-capture.",
+    )
+
     st.warning("Hackathon demo mode")
 
 col1, col2 = st.columns([3, 1])
@@ -108,6 +117,7 @@ if start_btn and repo_url:
                 status_callback=update_status,
                 skip_ai=current_mode["skip_ai"],
                 notify_github=current_mode["notify_github"],
+                max_pages=int(max_pages),
             )
 
             status.update(label="Process complete!", state="complete", expanded=False)
@@ -151,6 +161,38 @@ if start_btn and repo_url:
 
             with st.expander("Show raw Git diff"):
                 st.code(results["git_diff"], language="diff")
+
+            page_screens = results.get("page_screenshots") or {}
+            page_order = results.get("page_order") or list(page_screens.keys())
+            if page_order:
+                st.divider()
+                st.subheader("🗂 Per-Page Views")
+                for idx, label in enumerate(page_order):
+                    page = page_screens.get(label)
+                    if not page:
+                        continue
+                    with st.expander(f"Page: {label}", expanded=(idx == 0)):
+                        b_col, f_col = st.columns(2)
+                        base_full = page.get("base", {}).get("full")
+                        feature_full = page.get("feature", {}).get("full")
+                        feature_focus = page.get("feature", {}).get("partial")
+
+                        with b_col:
+                            st.markdown("**Base**")
+                            if base_full:
+                                st.image(base_full, caption=f"{label} (Base)")
+                            else:
+                                st.warning("No base screenshot")
+
+                        with f_col:
+                            st.markdown("**Feature**")
+                            if feature_full:
+                                st.image(feature_full, caption=f"{label} (Feature)")
+                            else:
+                                st.warning("No feature screenshot")
+
+                        if feature_focus:
+                            st.image(feature_focus, caption="Focus (Feature)", width=400)
 
     except Exception as exec_err:  # pragma: no cover
         st.error(f"An error occurred: {exec_err}")
