@@ -37,3 +37,21 @@ This repository hosts our E2B Hackathon demo project. The event rules we must sa
 - UI flow that lets users point to diff regions via natural language.
 - Screenshot-based diff viewer integrated into the app.
 - Automated branch creation and PR scaffolding.
+
+## MCP Configuration
+This app now relies on the **E2B Code Interpreter MCP server** to drive Playwright automation. Configure the following environment variables in `.env`:
+
+```
+# Required
+E2B_API_KEY=sk_e2b_xxx
+
+# MCP server command (defaults shown)
+MCP_SERVER_COMMAND=npx
+MCP_SERVER_ARGS=-y @e2b/mcp-server
+
+# Optional overrides
+CODE_MCP_COMMAND=["npx","-y","@e2b/mcp-server"]  # takes precedence if set
+CODE_MCP_TOOL=execute_code
+```
+
+When the agent runs, it launches the MCP server via `npx -y @e2b/mcp-server`, sends Playwright scripts through the `execute_code` tool, and receives screenshots as base64 blobs. Update any LLM promps/system messages to instruct the model to “write Playwright code and call `execute_code`” instead of invoking fixed `playwright_*` tools.

@@ -4,6 +4,7 @@ import json
 import time
 import re
 import shlex
+import textwrap
 from pathlib import Path
 from string import Template
 from e2b_code_interpreter import Sandbox
@@ -41,17 +42,34 @@ class DiffVisionAgent:
         except ValueError:
             return None
 
+    def _resolve_code_mcp_command(self):
+        direct = os.getenv("CODE_MCP_COMMAND")
+        if direct:
+            parsed = self._parse_command(direct)
+            if parsed:
+                return parsed
+        server_cmd = os.getenv("MCP_SERVER_COMMAND")
+        if server_cmd:
+            parts = [server_cmd.strip()]
+            server_args = os.getenv("MCP_SERVER_ARGS", "")
+            if server_args:
+                parts += shlex.split(server_args)
+            return parts
+        fallback = os.getenv("PLAYWRIGHT_MCP_COMMAND", "")
+        parsed_fallback = self._parse_command(fallback)
+        if parsed_fallback:
+            return parsed_fallback
+        return ["npx", "-y", "@e2b/mcp-server"]
+
     def __init__(self):
         self.e2b_api_key = os.getenv("E2B_API_KEY")
         self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.github_token = os.getenv("GITHUB_ACCESS_TOKEN")
         self.mcp_github_pat = os.getenv("MCP_GITHUB_PAT")
-        self.mcp_playwright_data = os.getenv("MCP_PLAYWRIGHT_DATA")
         self.github_mcp_command = self._parse_command(os.getenv("GITHUB_MCP_COMMAND", ""))
         self.github_mcp_tool = os.getenv("GITHUB_MCP_TOOL")
-        self.playwright_mcp_command = self._parse_command(os.getenv("PLAYWRIGHT_MCP_COMMAND", ""))
-        self.playwright_nav_tool = os.getenv("PLAYWRIGHT_MCP_NAV_TOOL", "browser_navigate")
-        self.playwright_screenshot_tool = os.getenv("PLAYWRIGHT_MCP_SCREENSHOT_TOOL", "browser_take_screenshot")
+        self.code_mcp_command = self._resolve_code_mcp_command()
+        self.code_mcp_tool = os.getenv("CODE_MCP_TOOL", "execute_code")
         self.sandbox_python_cmd = os.getenv("SANDBOX_PYTHON_CMD") or os.getenv("PYTHON_CMD") or "python3"
 
         if not self.e2b_api_key:
@@ -197,8 +215,6 @@ class DiffVisionAgent:
         mcp_servers = {}
         if self.mcp_github_pat:
             mcp_servers["github"] = {"personalAccessToken": self.mcp_github_pat}
-        if self.mcp_playwright_data:
-            mcp_servers["playwright"] = {"data": self.mcp_playwright_data}
         return mcp_servers
 
     def detect_navigation_targets(self, diff_text: str, repo_url: str, sandbox, max_pages: int = 1, logger=None):
@@ -418,10 +434,10 @@ Respond with JSON only.
 
     def _capture_branch_pages(self, sandbox, branch_name, label, branch_key, targets, logger=None):
         logger = logger or (lambda *_: None)
-        if self.playwright_mcp_command:
-            logger(f"🎥 Playwright MCP を使用して {label} のスクリーンショットを取得します。")
-            return self._capture_branch_pages_mcp(sandbox, branch_name, label, branch_key, targets, logger=logger)
-        logger(f"🎥 Playwright MCP が無効のためローカル Playwright で {label} を撮影します。")
+        if self.code_mcp_command:
+            logger(f"🎥 E2B Code Interpreter MCP を使用して {label} のスクリーンショットを取得します。")
+            return self._capture_branch_pages_code_mcp(sandbox, branch_name, label, branch_key, targets, logger=logger)
+        logger(f"🎥 Code Interpreter MCP が無効のためローカル Playwright で {label} を撮影します。")
         return self._capture_branch_pages_local(sandbox, branch_name, label, branch_key, targets, logger=logger)
 
     def _capture_branch_pages_local(self, sandbox, branch_name, label, branch_key, targets, logger=None):
@@ -470,7 +486,7 @@ Respond with JSON only.
         sandbox.commands.run("pkill -f node")
         return branch_results
 
-    def _capture_branch_pages_mcp(self, sandbox, branch_name, label, branch_key, targets, logger=None):
+    def _capture_branch_pages_code_mcp(self, sandbox, branch_name, label, branch_key, targets, logger=None):
         logger = logger or (lambda *_: None)
         log_prefix = f"{label}: {branch_name}"
         target_count = len(targets) if targets else 0
@@ -482,38 +498,54 @@ Respond with JSON only.
 
         branch_results = {}
         base_url = "http://localhost:5173"
-        focus_warning_logged = False
         for target in prepared_targets:
             branch_results[target["label"]] = {"full": None, "partial": None}
             url = base_url + (target["path"] or "/")
-            self._call_playwright_tool(
-                sandbox,
-                self.playwright_nav_tool,
-                {"url": url},
-            )
-
-            screenshot_args = {
-                "filename": f"{target['safe_label']}_{branch_key}_full.png",
-                "fullPage": True,
-            }
-            full_resp = self._call_playwright_tool(sandbox, self.playwright_screenshot_tool, screenshot_args)
-            full_bytes = self._extract_mcp_image(full_resp)
+            selector = target.get("selector") or "body"
+            code = self._build_code_executor_script(url, selector)
+            response = self._run_code_mcp(sandbox, code)
+            full_bytes, focus_bytes = self._parse_code_executor_response(response)
             if full_bytes:
                 branch_results[target["label"]]["full"] = full_bytes
-
-            selector = target.get("selector") or "body"
-            if selector:
-                if not focus_warning_logged:
-                    logger(
-                        "⚠️ Playwright MCP はセレクタ単位のスクリーンショットに未対応のためフォーカス画像をスキップします。"
-                    )
-                    focus_warning_logged = True
+            if focus_bytes:
+                branch_results[target["label"]]["partial"] = focus_bytes
+            if not full_bytes:
+                logger(f"⚠️ {log_prefix} -> {target['label']} のフルスクリーンショット取得に失敗しました。")
 
         sandbox.commands.run("pkill -f node")
         return branch_results
 
-    def _call_playwright_tool(self, sandbox, tool_name, arguments):
-        if not self.playwright_mcp_command:
+    def _build_code_executor_script(self, url, selector):
+        url_literal = json.dumps(url)
+        selector_literal = json.dumps(selector or "body")
+        return textwrap.dedent(
+            f"""
+            import asyncio
+            import base64
+            from playwright.async_api import async_playwright
+
+            async def main():
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch()
+                    page = await browser.new_page()
+                    await page.goto({url_literal}, timeout=20000)
+                    await page.wait_for_timeout(2000)
+                    full_bytes = await page.screenshot(full_page=True)
+                    print("FULL_B64::" + base64.b64encode(full_bytes).decode())
+                    selector = {selector_literal}
+                    if selector:
+                        locator = page.locator(selector)
+                        if await locator.count() > 0:
+                            focus_bytes = await locator.first.screenshot()
+                            print("FOCUS_B64::" + base64.b64encode(focus_bytes).decode())
+                    await browser.close()
+
+            asyncio.run(main())
+            """
+        ).strip()
+
+    def _run_code_mcp(self, sandbox, code, language="python"):
+        if not self.code_mcp_command:
             return None
         requests = [
             {
@@ -521,20 +553,59 @@ Respond with JSON only.
                 "method": "tools/call",
                 "id": 1,
                 "params": {
-                    "name": tool_name,
-                    "arguments": arguments,
+                    "name": self.code_mcp_tool,
+                    "arguments": {"language": language, "code": code},
                 },
             }
         ]
         env_updates = {}
-        if self.mcp_playwright_data:
-            env_updates["PLAYWRIGHT_DATA"] = self.mcp_playwright_data
+        if self.e2b_api_key:
+            env_updates["E2B_API_KEY"] = self.e2b_api_key
         return self._call_mcp(
             sandbox,
-            self.playwright_mcp_command,
+            self.code_mcp_command,
             requests,
             env_updates if env_updates else None,
         )
+
+    def _parse_code_executor_response(self, response):
+        if not response:
+            return (None, None)
+        entry = response[0]
+        if entry.get("error"):
+            return (None, None)
+        contents = entry.get("result", {}).get("content", [])
+        text_output = []
+        images = []
+        for item in contents:
+            if item.get("type") == "text" and item.get("text"):
+                text_output.append(item["text"])
+            elif item.get("type") == "image" and item.get("data"):
+                try:
+                    images.append(base64.b64decode(item["data"]))
+                except Exception:
+                    continue
+        text_blob = "\n".join(text_output)
+        full_bytes = self._extract_b64_from_text(text_blob, "FULL_B64::")
+        focus_bytes = self._extract_b64_from_text(text_blob, "FOCUS_B64::")
+        if not full_bytes and images:
+            full_bytes = images[0]
+        if not focus_bytes and images[1:]:
+            focus_bytes = images[1]
+        return (full_bytes, focus_bytes)
+
+    @staticmethod
+    def _extract_b64_from_text(text_blob, marker):
+        if not text_blob or marker not in text_blob:
+            return None
+        pattern = rf"{re.escape(marker)}([A-Za-z0-9+/=]+)"
+        match = re.search(pattern, text_blob)
+        if not match:
+            return None
+        try:
+            return base64.b64decode(match.group(1))
+        except Exception:
+            return None
 
     def analyze_pr(
         self,
