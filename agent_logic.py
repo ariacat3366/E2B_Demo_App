@@ -9,11 +9,7 @@ from pathlib import Path
 from string import Template
 from e2b_code_interpreter import Sandbox
 from dotenv import load_dotenv
-
-try:
-    from groq import Groq
-except ImportError:  # pragma: no cover
-    Groq = None
+from groq import Groq
 
 load_dotenv()
 
