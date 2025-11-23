@@ -15,21 +15,6 @@
         "GITHUB_DEFAULT_REPOSITORY": "${MCP_GITHUB_REPOSITORY:-owner/repo}"
       },
       "description": "Read/write GitHub resources via MCP."
-    },
-    {
-      "name": "playwright",
-      "transport": {
-        "type": "stdio",
-        "command": "python3",
-        "args": [
-          "scripts/playwright_mcp_server.py"
-        ]
-      },
-      "env": {
-        "PLAYWRIGHT_BASE_URL": "${PLAYWRIGHT_BASE_URL:-http://localhost:5173}",
-        "PLAYWRIGHT_WAIT_AFTER_MS": "${PLAYWRIGHT_WAIT_AFTER_MS:-2000}"
-      },
-      "description": "Local Playwright MCP server used for browser automation."
     }
   ]
 }
