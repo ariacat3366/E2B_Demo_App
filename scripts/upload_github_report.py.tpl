@@ -6,7 +6,8 @@ from github import Github, Auth
 token = os.getenv("GITHUB_ACCESS_TOKEN")
 auth = Auth.Token(token)
 g = Github(auth=auth)
-repo = g.get_repo("$repo_name")
+repo_name = "$repo_name"
+repo = g.get_repo(repo_name)
 pr = repo.get_pull($pr_number)
 
 branch_name = "diff-artifacts"
