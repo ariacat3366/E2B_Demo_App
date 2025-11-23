@@ -1,10 +1,11 @@
 import os
 import time
 import json
-from github import Github
+from github import Github, Auth
 
 token = os.getenv("GITHUB_ACCESS_TOKEN")
-g = Github(token)
+auth = Auth.Token(token)
+g = Github(auth=auth)
 repo = g.get_repo("$repo_name")
 pr = repo.get_pull($pr_number)
 
@@ -20,15 +21,32 @@ base_path = f"reports/pr_$pr_number/{timestamp}"
 
 def upload_file(path, content, msg):
     try:
-        repo.create_file(
-            path=f"{base_path}/{path}",
-            message=msg,
-            content=content,
-            branch=branch_name
-        )
+        full_path = f"{base_path}/{path}"
+        # Check if file exists and update if it does, otherwise create
+        try:
+            existing = repo.get_contents(full_path, ref=branch_name)
+            repo.update_file(
+                path=full_path,
+                message=msg,
+                content=content,
+                sha=existing.sha,
+                branch=branch_name
+            )
+            print(f"✅ Updated: {full_path}")
+        except Exception:
+            # File doesn't exist, create it
+            repo.create_file(
+                path=full_path,
+                message=msg,
+                content=content,
+                branch=branch_name
+            )
+            print(f"✅ Created: {full_path}")
         return f"https://raw.githubusercontent.com/{repo_name}/{branch_name}/{base_path}/{path}"
     except Exception as e:
-        print(f"UPLOAD_FAIL: {e}")
+        print(f"UPLOAD_FAIL ({path}): {type(e).__name__}: {e}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()[:500]}")
         return None
 
 page_manifest = []
@@ -55,16 +73,43 @@ for entry in ordered_entries:
     feature_full = os.path.join(label_path, "feature_full.png")
     feature_focus = os.path.join(label_path, "feature_focus.png")
     if os.path.exists(base_full):
-        record["base_full"] = upload_file(f"{safe_label}/base_full.png", open(base_full, "rb").read(), f"Add base full {display_label}")
+        content = open(base_full, "rb").read()
+        print(f"📤 Uploading {safe_label}/base_full.png ({len(content)} bytes)")
+        record["base_full"] = upload_file(f"{safe_label}/base_full.png", content, f"Add base full {display_label}")
     if os.path.exists(feature_full):
-        record["feature_full"] = upload_file(f"{safe_label}/feature_full.png", open(feature_full, "rb").read(), f"Add feature full {display_label}")
+        content = open(feature_full, "rb").read()
+        print(f"📤 Uploading {safe_label}/feature_full.png ({len(content)} bytes)")
+        record["feature_full"] = upload_file(f"{safe_label}/feature_full.png", content, f"Add feature full {display_label}")
     if os.path.exists(feature_focus):
-        record["feature_focus"] = upload_file(f"{safe_label}/feature_focus.png", open(feature_focus, "rb").read(), f"Add feature focus {display_label}")
+        content = open(feature_focus, "rb").read()
+        print(f"📤 Uploading {safe_label}/feature_focus.png ({len(content)} bytes)")
+        record["feature_focus"] = upload_file(f"{safe_label}/feature_focus.png", content, f"Add feature focus {display_label}")
     page_manifest.append(record)
 
-url_before = upload_file("before.png", open("/home/user/before.png", "rb").read(), "Add before img") if os.path.exists("/home/user/before.png") else None
-url_after = upload_file("after.png", open("/home/user/after.png", "rb").read(), "Add after img") if os.path.exists("/home/user/after.png") else None
-url_partial = upload_file("focus.png", open("/home/user/diff_focus.png", "rb").read(), "Add focus img") if os.path.exists("/home/user/diff_focus.png") else None
+url_before = None
+url_after = None
+url_partial = None
+
+if os.path.exists("/home/user/before.png"):
+    content = open("/home/user/before.png", "rb").read()
+    print(f"📤 Uploading before.png ({len(content)} bytes)")
+    url_before = upload_file("before.png", content, "Add before img")
+else:
+    print("⚠️ before.png does not exist")
+
+if os.path.exists("/home/user/after.png"):
+    content = open("/home/user/after.png", "rb").read()
+    print(f"📤 Uploading after.png ({len(content)} bytes)")
+    url_after = upload_file("after.png", content, "Add after img")
+else:
+    print("⚠️ after.png does not exist")
+
+if os.path.exists("/home/user/diff_focus.png"):
+    content = open("/home/user/diff_focus.png", "rb").read()
+    print(f"📤 Uploading focus.png ({len(content)} bytes)")
+    url_partial = upload_file("focus.png", content, "Add focus img")
+else:
+    print("ℹ️ diff_focus.png does not exist (optional)")
 
 report_text = open("/home/user/report.txt").read() if os.path.exists("/home/user/report.txt") else ""
 
@@ -94,6 +139,12 @@ if table_rows:
 
 if url_partial:
     comment_body += f"\n### 🔍 Focus Area\n![]({url_partial})"
+
+print("\n📊 Upload Summary:")
+print(f"  - Main images: before={url_before is not None}, after={url_after is not None}, focus={url_partial is not None}")
+print(f"  - Page screenshots: {len(page_manifest)} pages processed")
+for entry in page_manifest:
+    print(f"    - {entry['label']}: base={entry['base_full'] is not None}, feature={entry['feature_full'] is not None}, focus={entry['feature_focus'] is not None}")
 
 pr.create_issue_comment(comment_body)
 print("GITHUB_SUCCESS")

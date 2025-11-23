@@ -93,8 +93,9 @@ class DiffVisionAgent:
             raise ValueError("E2B_API_KEY not found in .env")
 
         self.groq_client = Groq(api_key=self.groq_api_key) if self.groq_api_key and Groq else None
-        self.selector_model = os.getenv("GROQ_SELECTOR_MODEL", "llama3-8b-8192")
-        self.target_model = os.getenv("GROQ_TARGET_MODEL", "llama3-8b-8192")
+        # Updated models: llama3-8b-8192 has been decommissioned
+        self.selector_model = os.getenv("GROQ_SELECTOR_MODEL", "llama-3.3-70b-versatile")
+        self.target_model = os.getenv("GROQ_TARGET_MODEL", "llama-3.3-70b-versatile")
         self.vision_model = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
         self.diff_prompt_chars = int(os.getenv("GIT_DIFF_PROMPT_CHARS", "6000"))
 
@@ -180,12 +181,26 @@ class DiffVisionAgent:
         even if explicit initialization hasn't completed.
         """
         if not self.mcp_gateway_url or not mcp_requests:
+            print(
+                f"[Agent] ⚠️ Cannot make MCP HTTP call: gateway_url={self.mcp_gateway_url}, requests={len(mcp_requests) if mcp_requests else 0}"
+            )
+            return None
+
+        # Validate MCP Gateway URL format
+        if not isinstance(self.mcp_gateway_url, str) or len(self.mcp_gateway_url.strip()) == 0:
+            print(f"[Agent] ⚠️ Invalid MCP Gateway URL (empty or not a string): {repr(self.mcp_gateway_url)}")
+            return None
+
+        if not self.mcp_gateway_url.startswith(("http://", "https://")):
+            print(f"[Agent] ⚠️ Invalid MCP Gateway URL (missing protocol): {self.mcp_gateway_url}")
             return None
 
         # Log warning if not initialized, but still attempt the call
         # E2B may not require explicit initialization
         if not self._mcp_initialized:
             print("[Agent] ℹ️ Attempting MCP call without explicit initialization (E2B may auto-manage)")
+
+        print(f"[Agent] 🔗 Using MCP Gateway URL: {self.mcp_gateway_url}")
 
         headers = {"Content-Type": "application/json"}
         if self.mcp_gateway_token:
@@ -228,12 +243,24 @@ class DiffVisionAgent:
             except requests.exceptions.RequestException as e:
                 error_msg = f"HTTP error for {req.get('method', 'unknown')}: {str(e)}"
                 print(f"[Agent] ⚠️ {error_msg}")
+                print(f"[Agent] 🔍 Request URL: {self.mcp_gateway_url}")
+                print(f"[Agent] 🔍 Exception type: {type(e).__name__}")
+                print(f"[Agent] 🔍 Exception args: {e.args}")
                 if hasattr(e, "response") and e.response is not None:
                     print(f"[Agent] 📋 Response body: {e.response.text[:300]}")
+                results.append({"error": {"message": error_msg}})
+            except OSError as e:
+                error_msg = f"OS error for {req.get('method', 'unknown')}: {str(e)}"
+                print(f"[Agent] ⚠️ {error_msg}")
+                print(f"[Agent] 🔍 Request URL: {self.mcp_gateway_url}")
+                print(f"[Agent] 🔍 OS error code: {e.errno}")
+                print(f"[Agent] 🔍 OS error message: {e.strerror}")
                 results.append({"error": {"message": error_msg}})
             except Exception as e:
                 error_msg = f"Unexpected error for {req.get('method', 'unknown')}: {str(e)}"
                 print(f"[Agent] ⚠️ {error_msg}")
+                print(f"[Agent] 🔍 Request URL: {self.mcp_gateway_url}")
+                print(f"[Agent] 🔍 Exception type: {type(e).__name__}")
                 results.append({"error": {"message": error_msg}})
 
         return results if results else None
@@ -574,10 +601,16 @@ class DiffVisionAgent:
             file_content = file_entry.get("content") or file_entry.get("text") or ""
             if not file_content:
                 logger(f"      ファイル内容がレスポンスに含まれていないため、個別に読み込みます...")
-                file_content = self._github_mcp_read_file(sandbox, file_path, repo_url=repo_url, pr_number=pr_number)
-            logger(f"      Content length: {len(file_content) if file_content else 0}")
+                file_content = self._github_mcp_read_file(
+                    sandbox, file_path, repo_url=repo_url, pr_number=pr_number, logger=logger
+                )
 
-            groq_targets = self._groq_targets_from_file(file_path, diff_lines, file_content)
+            content_len = len(file_content) if file_content else 0
+            logger(f"      Content length: {content_len}")
+            if file_content and content_len < 200:
+                logger(f"      🔍 Content (first 200 chars): {file_content[:200]}")
+
+            groq_targets = self._groq_targets_from_file(file_path, diff_lines, file_content, logger=logger)
             if groq_targets:
                 logger(f"      ✅ Groq から {len(groq_targets)} 件のターゲットを取得")
             else:
@@ -981,13 +1014,14 @@ class DiffVisionAgent:
         logger("⚠️ GitHub MCP: PRメタデータを取得できませんでした")
         return None
 
-    def _github_mcp_read_file(self, sandbox, file_path, repo_url=None, pr_number=None):
+    def _github_mcp_read_file(self, sandbox, file_path, repo_url=None, pr_number=None, logger=None):
         # Check if MCP is available (E2B Gateway or stdio)
         if not self.use_e2b_mcp_gateway and not self.github_mcp_command:
             return None
         if self.use_e2b_mcp_gateway and not self.mcp_gateway_url:
             return None
 
+        logger = logger or (lambda *_: None)
         owner, repo = self._parse_repo_info(repo_url)
 
         # E2B MCP Gateway uses github-official-get_file_contents
@@ -1014,32 +1048,80 @@ class DiffVisionAgent:
             env_updates["GITHUB_PERSONAL_ACCESS_TOKEN"] = self.mcp_github_pat
         response = self._call_mcp(sandbox, self.github_mcp_command, requests, env_updates)
         if not response:
+            logger(f"      🔍 No response from MCP for file: {file_path}")
             return None
         entry = response[0] if isinstance(response, list) else response
+
+        # Debug: レスポンス全体をログ出力（最初の500文字）
+        logger(f"      🔍 Full response: {json.dumps(entry, indent=2)[:500]}")
+
         if entry.get("error"):
+            error_msg = entry.get("error", {}).get("message", "Unknown error")
+            logger(f"      ⚠️ MCP error reading file: {error_msg}")
             return None
         contents = entry.get("result", {}).get("content", [])
+        logger(f"      🔍 Response has {len(contents)} content items")
+
         for item in contents:
-            if item.get("type") == "text" and item.get("text"):
-                return item["text"]
-            if item.get("type") == "json" and item.get("data"):
+            item_type = item.get("type")
+            logger(f"      🔍 Processing content type: {item_type}")
+
+            # GitHub MCP returns file content in type: "resource" with text field
+            if item_type == "resource" and item.get("resource"):
+                resource = item["resource"]
+                if resource.get("text"):
+                    text_content = resource["text"]
+                    logger(f"      ✅ Got resource text content: {len(text_content)} chars")
+                    return text_content
+
+            # Fallback to plain text type
+            if item_type == "text" and item.get("text"):
+                text_content = item["text"]
+                # Skip status messages like "successfully downloaded..."
+                if not text_content.startswith("successfully"):
+                    logger(f"      ✅ Got text content: {len(text_content)} chars")
+                    return text_content
+                else:
+                    logger(f"      ⏭️ Skipping status message: {text_content[:50]}")
+
+            if item_type == "json" and item.get("data"):
                 # GitHub returns base64-encoded content
                 data = item["data"]
+                logger(f"      🔍 JSON data keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
+
                 if isinstance(data, dict) and data.get("content"):
                     import base64
 
                     try:
-                        return base64.b64decode(data["content"]).decode("utf-8")
-                    except Exception:
+                        decoded = base64.b64decode(data["content"]).decode("utf-8")
+                        logger(f"      ✅ Decoded base64 content: {len(decoded)} chars")
+                        return decoded
+                    except Exception as e:
+                        logger(f"      ⚠️ Failed to decode base64: {e}")
                         pass
-                return str(data)
+
+                # Try returning as string
+                str_data = str(data)
+                logger(f"      ⚠️ Returning data as string: {len(str_data)} chars")
+                return str_data
+
+        logger(f"      ⚠️ No usable content found in response")
         return None
 
-    def _groq_targets_from_file(self, file_path, diff_lines, file_content):
+    def _groq_targets_from_file(self, file_path, diff_lines, file_content, logger=None):
+        logger = logger or (lambda *_: None)
+
         if not self.groq_client:
+            logger(f"      ⚠️ Groq client not configured")
             return None
+
         diff_excerpt = "\n".join(diff_lines or [])[:2000]
         file_excerpt = (file_content or "")[:2000]
+
+        logger(
+            f"      🔍 Calling Groq with diff_excerpt: {len(diff_excerpt)} chars, file_excerpt: {len(file_excerpt)} chars"
+        )
+
         prompt = f"""
 You are a UI diff analyst. Given a Git diff snippet and the current file content, identify the UI elements most likely impacted.
 Return a JSON array where each element has:
@@ -1069,12 +1151,27 @@ Respond with JSON only.
                 response_format={"type": "json_object"},
             )
             content = completion.choices[0].message.content
+            logger(f"      🔍 Groq response: {content[:200]}")
+
             data = json.loads(content)
-            if isinstance(data, dict) and "targets" in data:
-                data = data["targets"]
+            # Groqがラップされた辞書形式で返す場合に対応
+            if isinstance(data, dict):
+                if "targets" in data:
+                    data = data["targets"]
+                elif "impactedElements" in data:
+                    data = data["impactedElements"]
+
             if isinstance(data, list):
+                logger(f"      ✅ Groq returned {len(data)} targets")
                 return data
-        except Exception:
+            else:
+                logger(f"      ⚠️ Groq response is not a list: {type(data).__name__}")
+                logger(f"      📋 Response keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+        except Exception as e:
+            logger(f"      ⚠️ Groq error: {e}")
+            import traceback
+
+            logger(f"      📋 Traceback: {traceback.format_exc()[:300]}")
             return None
         return None
 
@@ -1466,14 +1563,32 @@ Respond with JSON only.
                 try:
                     self.mcp_gateway_url = sandbox.get_mcp_url()
                     self._mcp_initialized = False  # Reset initialization flag for new sandbox
+
+                    # Validate and log MCP Gateway URL
+                    if not self.mcp_gateway_url:
+                        log("⚠️ MCP Gateway URL is empty!")
+                        raise ValueError("MCP Gateway URL is empty")
+
                     log(f"🔗 E2B MCP Gateway URL: {self.mcp_gateway_url}")
+                    log(f"   URL type: {type(self.mcp_gateway_url)}, length: {len(str(self.mcp_gateway_url))}")
+
+                    # Validate URL format
+                    if not isinstance(self.mcp_gateway_url, str):
+                        log(f"⚠️ MCP Gateway URL is not a string: {type(self.mcp_gateway_url)}")
+                        raise ValueError(f"MCP Gateway URL must be a string, got {type(self.mcp_gateway_url)}")
+
+                    if not self.mcp_gateway_url.startswith(("http://", "https://")):
+                        log(f"⚠️ MCP Gateway URL missing protocol: {self.mcp_gateway_url}")
+                        raise ValueError(
+                            f"MCP Gateway URL must start with http:// or https://, got: {self.mcp_gateway_url}"
+                        )
 
                     # Get MCP Gateway token (if available)
                     try:
                         self.mcp_gateway_token = sandbox.get_mcp_token()
                         log("🔑 E2B MCP Gateway token acquired")
-                    except Exception:
-                        log("ℹ️ MCP Gateway token not required or not available")
+                    except Exception as token_error:
+                        log(f"ℹ️ MCP Gateway token not required or not available: {token_error}")
 
                     # Initialize MCP session immediately after getting the URL
                     if self.skip_mcp_initialization:
@@ -1699,9 +1814,9 @@ print(json.dumps({{
 
             if skip_ai:
                 log("ℹ️ AI analysis skipped by mode setting.")
-                return results
-
-            if self.groq_client:
+            elif not self.groq_client:
+                log("⚠️ Groq client not configured. Skipping AI analysis.")
+            else:
                 # スクリーンショットがなくてもGit diffだけでAI分析を実行
                 has_screenshots = results["main_screenshot"] and results["feature_screenshot"]
                 if has_screenshots:
@@ -1717,8 +1832,6 @@ print(json.dumps({{
                 except Exception as exc:  # pragma: no cover
                     log(f"⚠️ AI analysis failed: {exc}")
                     results["ai_report"] = "Analysis failed."
-            else:
-                log("⚠️ Groq client not configured. Skipping AI analysis.")
 
             if notify_github:
                 if not self.github_token:
@@ -1737,33 +1850,61 @@ print(json.dumps({{
 
                     if results["main_screenshot"]:
                         sandbox.files.write("/home/user/before.png", results["main_screenshot"])
+                        log(f"   ✅ before.png written ({len(results['main_screenshot'])} bytes)")
+                    else:
+                        log("   ⚠️ main_screenshot is None, skipping before.png")
+
                     if results["feature_screenshot"]:
                         sandbox.files.write("/home/user/after.png", results["feature_screenshot"])
+                        log(f"   ✅ after.png written ({len(results['feature_screenshot'])} bytes)")
+                    else:
+                        log("   ⚠️ feature_screenshot is None, skipping after.png")
+
                     if results["partial_screenshot"]:
                         sandbox.files.write("/home/user/diff_focus.png", results["partial_screenshot"])
+                        log(f"   ✅ diff_focus.png written ({len(results['partial_screenshot'])} bytes)")
+                    else:
+                        log("   ℹ️ partial_screenshot is None, skipping diff_focus.png")
 
                     screens_dir = "/home/user/screens"
                     sandbox.commands.run(f"rm -rf {screens_dir} && mkdir -p {screens_dir}", timeout=30)
                     manifest_entries = []
                     ordered_labels = results.get("page_order") or list(results["page_screenshots"].keys())
+                    log(f"   📁 Processing {len(ordered_labels)} pages for GitHub upload...")
+
                     for idx, label_name in enumerate(ordered_labels):
                         page_data = results["page_screenshots"].get(label_name)
                         if not page_data:
+                            log(f"   ⚠️ Page '{label_name}' has no data, skipping")
                             continue
                         safe_label = page_data.get("safe_label") or self._safe_label(label_name, idx)
                         manifest_entries.append({"label": label_name, "safe_label": safe_label})
                         page_dir = f"{screens_dir}/{safe_label}"
                         sandbox.commands.run(f"mkdir -p {page_dir}", timeout=10)
+
                         base_full = page_data.get("base", {}).get("full")
                         if base_full:
                             sandbox.files.write(f"{page_dir}/base_full.png", base_full)
+                            log(f"   ✅ {label_name}/base_full.png ({len(base_full)} bytes)")
+                        else:
+                            log(f"   ⚠️ {label_name}/base_full.png is None")
+
                         feature_full = page_data.get("feature", {}).get("full")
                         if feature_full:
                             sandbox.files.write(f"{page_dir}/feature_full.png", feature_full)
+                            log(f"   ✅ {label_name}/feature_full.png ({len(feature_full)} bytes)")
+                        else:
+                            log(f"   ⚠️ {label_name}/feature_full.png is None")
+
                         feature_focus = page_data.get("feature", {}).get("partial")
                         if feature_focus:
                             sandbox.files.write(f"{page_dir}/feature_focus.png", feature_focus)
+                            log(f"   ✅ {label_name}/feature_focus.png ({len(feature_focus)} bytes)")
+                        else:
+                            log(f"   ℹ️ {label_name}/feature_focus.png is None")
+
                     sandbox.files.write(f"{screens_dir}/manifest.json", json.dumps(manifest_entries).encode("utf-8"))
+                    log(f"   ✅ manifest.json written with {len(manifest_entries)} entries")
 
                     github_script = self._render_template(
                         "upload_github_report.py.tpl",
@@ -1771,11 +1912,24 @@ print(json.dumps({{
                         pr_number=current_pr_number,
                     )
                     sandbox.files.write("/home/user/post_gh.py", github_script)
+                    log("   🚀 Running GitHub upload script...")
                     gh_proc = sandbox.commands.run("python3 /home/user/post_gh.py", timeout=120)
-                    if "GITHUB_SUCCESS" in self._to_text(gh_proc.stdout):
+
+                    stdout = self._to_text(gh_proc.stdout)
+                    stderr = self._to_text(gh_proc.stderr)
+
+                    if stdout:
+                        log(f"   📤 Upload stdout: {stdout[:500]}")
+                    if stderr:
+                        log(f"   ⚠️ Upload stderr: {stderr[:500]}")
+
+                    if "GITHUB_SUCCESS" in stdout:
                         log("✅ GitHub comment posted with artifacts.")
                     else:
-                        log(f"⚠️ GitHub post failed: {self._to_text(gh_proc.stdout)} {self._to_text(gh_proc.stderr)}")
+                        log(f"⚠️ GitHub post failed.")
+                        log(f"   Exit code: {gh_proc.exit_code}")
+                        if "UPLOAD_FAIL" in stdout:
+                            log("   ⚠️ Some files failed to upload to GitHub")
             else:
                 log("ℹ️ Skipping GitHub notification per mode setting.")
 
