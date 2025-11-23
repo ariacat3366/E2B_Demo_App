@@ -4,9 +4,9 @@ import subprocess
 import threading
 import queue
 
-COMMAND = $command_json
-REQUESTS = $requests_json
-ENV_UPDATES = $env_updates_json
+COMMAND = json.loads(r'''$command_json''')
+REQUESTS = json.loads(r'''$requests_json''')
+ENV_UPDATES = json.loads(r'''$env_updates_json''')
 
 
 def run():

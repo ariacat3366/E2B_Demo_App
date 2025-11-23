@@ -194,6 +194,12 @@ if start_btn and repo_url:
                         if feature_focus:
                             st.image(feature_focus, caption="Focus (Feature)", width=400)
 
+            st.divider()
+            st.subheader("🪵 Execution Logs")
+            with st.expander("詳細ログを表示", expanded=False):
+                logs_text = "\n".join(results.get("logs") or [])
+                st.code(logs_text or "No logs recorded.", language="text")
+
     except Exception as exec_err:  # pragma: no cover
         st.error(f"An error occurred: {exec_err}")
         st.code(traceback.format_exc())

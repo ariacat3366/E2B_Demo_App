@@ -39,19 +39,24 @@ This repository hosts our E2B Hackathon demo project. The event rules we must sa
 - Automated branch creation and PR scaffolding.
 
 ## MCP Configuration
-This app now relies on the **E2B Code Interpreter MCP server** to drive Playwright automation. Configure the following environment variables in `.env`:
+We now use dedicated MCP servers for GitHub metadata and Playwright-driven screenshots. A sample `mcp.json` is included under `E2B_app/mcp.json`; adjust the commands as needed (Docker Hub images or local scripts are both supported). Configure the following environment variables in `.env`:
 
 ```
 # Required
 E2B_API_KEY=sk_e2b_xxx
+GITHUB_ACCESS_TOKEN=ghp_xxx              # used by PyGithub + GitHub uploads
+MCP_GITHUB_PAT=ghp_xxx                   # GitHub MCP (scopes: repo, read:org)
 
-# MCP server command (defaults shown)
-MCP_SERVER_COMMAND=npx
-MCP_SERVER_ARGS=-y @e2b/mcp-server
+# GitHub MCP client (defaults point to @modelcontextprotocol/server-github)
+GITHUB_MCP_COMMAND=["npx","-y","@modelcontextprotocol/server-github"]
+GITHUB_MCP_TOOL=get_pull_request_files   # tool must return files[] with patch/content
+MCP_GITHUB_REPOSITORY=owner/repo         # consumed by mcp.json (optional)
 
-# Optional overrides
-CODE_MCP_COMMAND=["npx","-y","@e2b/mcp-server"]  # takes precedence if set
-CODE_MCP_TOOL=execute_code
+# Playwright MCP (defaults to bundled Python server)
+PLAYWRIGHT_MCP_COMMAND=["python3","/home/user/playwright_mcp_server.py"]
+PLAYWRIGHT_MCP_TOOL=playwright.capture
+PLAYWRIGHT_BASE_URL=http://localhost:5173
+PLAYWRIGHT_WAIT_AFTER_MS=2000
 ```
 
-When the agent runs, it launches the MCP server via `npx -y @e2b/mcp-server`, sends Playwright scripts through the `execute_code` tool, and receives screenshots as base64 blobs. Update any LLM promps/system messages to instruct the model to “write Playwright code and call `execute_code`” instead of invoking fixed `playwright_*` tools.
+During sandbox execution the agent launches both MCP servers, first running `resources/list` to confirm scope and then invoking `tools/call`. GitHub MCP is asked for the PR’s changed files (including `patch` + `content`),その結果を Groq に渡してページターゲットを JSON で生成し、Playwright MCP へ引き継ぎます。バンドル済み Playwright MCP サーバーは Python + Playwright のみで動作しますが、Docker Hub MCP（例: `ghcr.io/build-mcp/browser`）へ差し替える場合は `PLAYWRIGHT_MCP_COMMAND` を上書きしてください。Keep personal tokens out of tracked files—store them in `.env` and reference via environment variables inside `mcp.json`.
